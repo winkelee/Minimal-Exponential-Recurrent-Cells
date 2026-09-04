@@ -769,6 +769,9 @@ class eGRU(nn.Module):
 
         logits_matrix = []
 
+        m = torch.zeros((batch_size, self.hid), device=self.device)
+        norm = torch.ones((batch_size, self.hid), device=self.device)
+
         for i in range(x.shape[1]-1): #last entry is <STARTCOPY>
             current_token = x[:, i] #(batch, dim)
             cell_state, hid_state, m, norm = self.eGRUCell.forward(current_token, cell_state, m, norm)
