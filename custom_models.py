@@ -172,29 +172,75 @@ class CopyGRU(nn.Module): # To bench mGRU against
 
         return final_logits
 
+
+    def inspect_step(self, x, state):
+
+        W_r, W_z, W_n = self.GRUCell.weight_ih.chunk(3, dim=0)
+        U_r, U_z, U_n = self.GRUCell.weight_hh.chunk(3, dim=0)
+
+        b_ir, b_iz, b_in = self.GRUCell.bias_ih.chunk(3, dim=0)
+        b_hr, b_hz, b_hn = self.GRUCell.bias_hh.chunk(3, dim=0)
+
+        # Reset Gate (r)
+        r_tilde = F.linear(x, W_r, b_ir) + F.linear(state, U_r, b_hr)
+        r = torch.sigmoid(r_tilde)
+
+        # Update Gate (z)
+        z_tilde = F.linear(x, W_z, b_iz) + F.linear(state, U_z, b_hz)
+        z = torch.sigmoid(z_tilde)
+
+        n_tilde = F.linear(x, W_n, b_in) + r * F.linear(state, U_n, b_hn)
+        n = F.tanh(n_tilde)
+
+        new_state = z * state + (1-z)*n
+
+        return new_state, z, r
     
-    def predict_inference(self, x, vocab, max_len=30):
+    def predict_inference(self, x, vocab, max_len=30, diagnostic=False):
 
         batch_size = x.shape[0]
         state = self.init_hid.unsqueeze(0).expand(batch_size, -1)
 
         logits_matrix = []
+        z_history = []
+        r_history = []
 
         for i in range(x.shape[1]-1): #last entry is <STARTCOPY>
             current_token = x[:, i] #(batch, dim)
-            state = self.GRUCell(current_token, state)
+            if not diagnostic:
+                state = self.GRUCell(current_token, state)
+            else:
+                state, z, r = self.inspect_step(current_token, state)
+                z = z[0] if z.ndim > 1 else z
+                r = r[0] if r.ndim > 1 else r
+                z_history.append(z.detach().cpu().numpy())
+                r_history.append(r.detach().cpu().numpy())
         
         # The decoding starts here
 
         token = x[:, x.shape[1]-1] #load the <STARTCOPY> entry
-        state = self.GRUCell(token, state)
+        if not diagnostic:
+            state = self.GRUCell(token, state)
+        else:
+            state, z, r = self.inspect_step(token, state)
+            z = z[0] if z.ndim > 1 else z
+            r = r[0] if r.ndim > 1 else r
+            z_history.append(z.detach().cpu().numpy())
+            r_history.append(r.detach().cpu().numpy())
         logits = self.linear_proj(state) #(batch, emb)
         logits_matrix.append(logits)
         token = F.one_hot(torch.argmax(logits, dim=1), num_classes=len(vocab)).float()
         step=0
 
         while step < max_len:
-            state = self.GRUCell(token, state)
+            if not diagnostic:
+                state = self.GRUCell(token, state)
+            else:
+                state, z, r = self.inspect_step(token, state)
+                z = z[0] if z.ndim > 1 else z
+                r = r[0] if r.ndim > 1 else r
+                z_history.append(z.detach().cpu().numpy())
+                r_history.append(r.detach().cpu().numpy())
             logits = self.linear_proj(state) #(batch, emb)
             logits_matrix.append(logits)
             token = F.one_hot(torch.argmax(logits, dim=1), num_classes=len(vocab)).float()
@@ -202,8 +248,13 @@ class CopyGRU(nn.Module): # To bench mGRU against
 
         final_logits = torch.stack(logits_matrix, dim=1)
 
-        return final_logits
-
+        if not diagnostic:
+            return final_logits
+        else:
+            return final_logits, {
+                "z_gate": z_history,
+                "r_gate": r_history
+            }
 
 class mLSTMLiteCell(nn.Module):
     def __init__(self, hid, emb, device):
@@ -358,7 +409,6 @@ class mLSTMLite(nn.Module):
         final_logits = torch.stack(logits_matrix, dim=1)
 
         return final_logits
-
 class mLSTMCell(nn.Module):
     def __init__(self, hid, emb, device):
         super().__init__()
@@ -379,7 +429,7 @@ class mLSTMCell(nn.Module):
 
         self.init_hid = nn.Parameter(torch.randn(hid, hid, device=device) * 0.1)
 
-    def forward(self, x, prev_cell_state, prev_m, prev_n):
+    def forward(self, x, prev_cell_state, prev_m, prev_n, diagnostic=False):
 
         q = self.W_q(x) #(batch, hid)
         k = self.W_k(x)/ math.sqrt(self.hid) #(batch, hid)
@@ -415,7 +465,10 @@ class mLSTMCell(nn.Module):
 
         new_hid_state = o * h_tilde
 
-        return cell_state, new_hid_state, m, new_norm
+        if not diagnostic:
+            return cell_state, new_hid_state, m, new_norm
+        else:
+            return cell_state, new_hid_state, m, new_norm, o, f, i
 
 class mLSTM(nn.Module):
     def __init__(self, hid, emb, device):
@@ -471,7 +524,7 @@ class mLSTM(nn.Module):
 
         return final_logits
 
-    def predict_inference(self, x, vocab, max_len=30):
+    def predict_inference(self, x, vocab, max_len=30, diagnostic=False):
 
         batch_size = x.shape[0]
         cell_state = self.mLSTMCell.init_hid.unsqueeze(0).expand(batch_size, -1, -1)
@@ -480,35 +533,55 @@ class mLSTM(nn.Module):
         m = torch.zeros((batch_size, 1), device=self.device)
         norm = torch.ones((batch_size, self.hid), device=self.device)
 
+        o_history = []
+        f_history = []
+        i_history = []
+
         logits_matrix = []
 
         for i in range(x.shape[1]-1): #last entry is <STARTCOPY>
             current_token = x[:, i] #(batch, dim)
-            cell_state, hid_state, m, norm = self.mLSTMCell.forward(
-                x=current_token, 
-                prev_cell_state=cell_state, 
-                prev_m=m,
-                prev_n=norm)
+            if not diagnostic:
+                cell_state, hid_state, m, norm = self.mLSTMCell.forward(x=current_token, prev_cell_state=cell_state, prev_m=m, prev_n=norm, diagnostic=False)
+            else:
+                cell_state, hid_state, m, norm, o, f, i = self.mLSTMCell.forward(x=current_token, prev_cell_state=cell_state, prev_m=m, prev_n=norm, diagnostic=True)
+                o = o[0] if o.ndim > 1 else o
+                f = f[0] if f.ndim > 1 else f
+                i = i[0] if i.ndim > 1 else i
+                o_history.append(o.detach().cpu().numpy())
+                f_history.append(f.detach().cpu().numpy())
+                i_history.append(i.detach().cpu().numpy())
+            
         
         # The decoding starts here
 
         token = x[:, x.shape[1]-1] #load the <STARTCOPY> entry
-        cell_state, hid_state, m, norm = self.mLSTMCell.forward(
-                x=token, 
-                prev_cell_state=cell_state, 
-                prev_m=m,
-                prev_n=norm)
+        if not diagnostic:
+            cell_state, hid_state, m, norm = self.mLSTMCell.forward(x=token, prev_cell_state=cell_state, prev_m=m, prev_n=norm, diagnostic=False)
+        else:
+            cell_state, hid_state, m, norm, o, f, i = self.mLSTMCell.forward(x=token, prev_cell_state=cell_state, prev_m=m, prev_n=norm, diagnostic=True)
+            o = o[0] if o.ndim > 1 else o
+            f = f[0] if f.ndim > 1 else f
+            i = i[0] if i.ndim > 1 else i
+            o_history.append(o.detach().cpu().numpy())
+            f_history.append(f.detach().cpu().numpy())
+            i_history.append(i.detach().cpu().numpy())
         logits = self.mLSTMCell.linear_pool(hid_state) #(batch, emb)
         logits_matrix.append(logits)
         token = F.one_hot(torch.argmax(logits, dim=1), num_classes=len(vocab)).float() 
         step=0
 
         while step < max_len:
-            cell_state, hid_state, m, norm = self.mLSTMCell.forward(
-                x=token, 
-                prev_cell_state=cell_state, 
-                prev_m=m,
-                prev_n=norm)
+            if not diagnostic:
+                cell_state, hid_state, m, norm = self.mLSTMCell.forward(x=token, prev_cell_state=cell_state, prev_m=m, prev_n=norm, diagnostic=False)
+            else:
+                cell_state, hid_state, m, norm, o, f, i = self.mLSTMCell.forward(x=token, prev_cell_state=cell_state, prev_m=m, prev_n=norm, diagnostic=True)
+                o = o[0] if o.ndim > 1 else o
+                f = f[0] if f.ndim > 1 else f
+                i = i[0] if i.ndim > 1 else i
+                o_history.append(o.detach().cpu().numpy())
+                f_history.append(f.detach().cpu().numpy())
+                i_history.append(i.detach().cpu().numpy())
             logits = self.mLSTMCell.linear_pool(hid_state) #(batch, emb)
             logits_matrix.append(logits)
             token = F.one_hot(torch.argmax(logits, dim=1), num_classes=len(vocab)).float()
@@ -516,7 +589,14 @@ class mLSTM(nn.Module):
 
         final_logits = torch.stack(logits_matrix, dim=1)
 
-        return final_logits
+        if not diagnostic:
+            return final_logits
+        else: 
+            return final_logits, {
+                "o_gate": o_history,
+                "f_gate": f_history,
+                "i_gate": i_history
+            }
 
 
 class sLSTMCell(nn.Module):
@@ -543,7 +623,7 @@ class sLSTMCell(nn.Module):
 
         self.init_hid = nn.Parameter(torch.randn(hid, device=device) * 0.1)
 
-    def forward(self, x, prev_cell_state, prev_hid_state, prev_m, prev_n):
+    def forward(self, x, prev_cell_state, prev_hid_state, prev_m, prev_n, diagnostic=False):
 
         z_tilde = self.W_z(x) + self.U_z(prev_hid_state)
         f_tilde = self.W_f(x) + self.U_f(prev_hid_state)
@@ -566,7 +646,7 @@ class sLSTMCell(nn.Module):
 
         new_hid_state = o * h_tilde
 
-        return cell_state, new_hid_state, m, new_norm
+        return cell_state, new_hid_state, m, new_norm, o, f, i
 
 class sLSTM(nn.Module):
     def __init__(self, hid, emb, device):
@@ -626,10 +706,14 @@ class sLSTM(nn.Module):
 
         return final_logits
 
-    def predict_inference(self, x, vocab, max_len=30):
+    def predict_inference(self, x, vocab, max_len=30, diagnostic=False):
 
         batch_size = x.shape[0]
         cell_state = self.sLSTMCell.init_hid.unsqueeze(0).expand(batch_size, -1)
+
+        o_history = []
+        f_history = []
+        i_history = []
 
          
         m = torch.zeros((batch_size, self.hid), device=self.device)
@@ -640,34 +724,83 @@ class sLSTM(nn.Module):
 
         for i in range(x.shape[1]-1): #last entry is <STARTCOPY>
             current_token = x[:, i] #(batch, dim)
-            cell_state, hid_state, m, norm = self.sLSTMCell.forward(
-                x=current_token, 
-                prev_cell_state=cell_state, 
-                prev_hid_state=hid_state,
-                prev_m=m,
-                prev_n=norm)
+            if not diagnostic:
+                cell_state, hid_state, m, norm = self.sLSTMCell.forward(
+                                                                x=current_token, 
+                                                                prev_cell_state=cell_state, 
+                                                                prev_hid_state=hid_state,
+                                                                prev_m=m,
+                                                                prev_n=norm,
+                                                                diagnostic=False)
+            else:
+                cell_state, hid_state, m, norm, o, f, i = self.sLSTMCell.forward(
+                                                                x=current_token, 
+                                                                prev_cell_state=cell_state, 
+                                                                prev_hid_state=hid_state,
+                                                                prev_m=m,
+                                                                prev_n=norm,
+                                                                diagnostic=True)
+                o = o[0] if o.ndim > 1 else o
+                f = f[0] if f.ndim > 1 else f
+                i = i[0] if i.ndim > 1 else i
+                o_history.append(o.detach().cpu().numpy())
+                f_history.append(f.detach().cpu().numpy())
+                i_history.append(i.detach().cpu().numpy())
+
         
         # The decoding starts here
 
         token = x[:, x.shape[1]-1] #load the <STARTCOPY> entry
-        cell_state, hid_state, m, norm = self.sLSTMCell.forward(
-                x=token, 
-                prev_cell_state=cell_state, 
-                prev_hid_state=hid_state,
-                prev_m=m,
-                prev_n=norm)
+        if not diagnostic:
+            cell_state, hid_state, m, norm = self.sLSTMCell.forward(
+                                                            x=token, 
+                                                            prev_cell_state=cell_state, 
+                                                            prev_hid_state=hid_state,
+                                                            prev_m=m,
+                                                            prev_n=norm,
+                                                            diagnostic=False)
+        else:
+            cell_state, hid_state, m, norm, o, f, i = self.sLSTMCell.forward(
+                                                            x=token, 
+                                                            prev_cell_state=cell_state, 
+                                                            prev_hid_state=hid_state,
+                                                            prev_m=m,
+                                                            prev_n=norm,
+                                                            diagnostic=True)
+            o = o[0] if o.ndim > 1 else o
+            f = f[0] if f.ndim > 1 else f
+            i = i[0] if i.ndim > 1 else i
+            o_history.append(o.detach().cpu().numpy())
+            f_history.append(f.detach().cpu().numpy())
+            i_history.append(i.detach().cpu().numpy())
         logits = self.sLSTMCell.linear_pool(hid_state) #(batch, emb)
         logits_matrix.append(logits)
         token = F.one_hot(torch.argmax(logits, dim=1), num_classes=len(vocab)).float() 
         step=0
 
         while step < max_len:
-            cell_state, hid_state, m, norm = self.sLSTMCell.forward(
-                x=token, 
-                prev_cell_state=cell_state, 
-                prev_hid_state=hid_state,
-                prev_m=m,
-                prev_n=norm)
+            if not diagnostic:
+                cell_state, hid_state, m, norm = self.sLSTMCell.forward(
+                                                                x=token, 
+                                                                prev_cell_state=cell_state, 
+                                                                prev_hid_state=hid_state,
+                                                                prev_m=m,
+                                                                prev_n=norm,
+                                                                diagnostic=False)
+            else:
+                cell_state, hid_state, m, norm, o, f, i = self.sLSTMCell.forward(
+                                                                x=token, 
+                                                                prev_cell_state=cell_state, 
+                                                                prev_hid_state=hid_state,
+                                                                prev_m=m,
+                                                                prev_n=norm,
+                                                                diagnostic=True)
+                o = o[0] if o.ndim > 1 else o
+                f = f[0] if f.ndim > 1 else f
+                i = i[0] if i.ndim > 1 else i
+                o_history.append(o.detach().cpu().numpy())
+                f_history.append(f.detach().cpu().numpy())
+                i_history.append(i.detach().cpu().numpy())
             logits = self.sLSTMCell.linear_pool(hid_state) #(batch, emb)
             logits_matrix.append(logits)
             token = F.one_hot(torch.argmax(logits, dim=1), num_classes=len(vocab)).float()
@@ -675,7 +808,15 @@ class sLSTM(nn.Module):
 
         final_logits = torch.stack(logits_matrix, dim=1)
 
-        return final_logits
+        if not diagnostic:
+            return final_logits
+        else:
+            return final_logits, {
+                "o_gate": o_history,
+                "f_gate": f_history,
+                "i_gate": i_history
+
+            }
 
 
 
@@ -700,7 +841,7 @@ class eGRUCell(nn.Module):
 
         self.init_hid = nn.Parameter(torch.randn(hid, device=device) * 0.1)
 
-    def forward(self, x, prev_cell_state, prev_m, prev_n):
+    def forward(self, x, prev_cell_state, prev_m, prev_n, diagnostic=False):
 
         hid_state = prev_cell_state / prev_n
 
@@ -718,8 +859,10 @@ class eGRUCell(nn.Module):
 
         cell_state = z*prev_cell_state + r*h_tilde
         new_hid_state = cell_state / new_norm
-
-        return cell_state, new_hid_state, m, new_norm
+        if not diagnostic:
+            return cell_state, new_hid_state, m, new_norm
+        else:
+            return cell_state, new_hid_state, m, new_norm, z, r
 
 class eGRU(nn.Module):
     def __init__(self, hid, emb, device):
@@ -762,39 +905,70 @@ class eGRU(nn.Module):
 
         return final_logits
 
-    def predict_inference(self, x, vocab, max_len=30):
+    def predict_inference(self, x, vocab, max_len=30, diagnostic=False):
 
         batch_size = x.shape[0]
         cell_state = self.eGRUCell.init_hid.unsqueeze(0).expand(batch_size, -1)
 
         logits_matrix = []
+        z_history = []
+        r_history = []
+
 
         m = torch.zeros((batch_size, self.hid), device=self.device)
         norm = torch.ones((batch_size, self.hid), device=self.device)
 
         for i in range(x.shape[1]-1): #last entry is <STARTCOPY>
             current_token = x[:, i] #(batch, dim)
-            cell_state, hid_state, m, norm = self.eGRUCell.forward(current_token, cell_state, m, norm)
+            if not diagnostic:
+                cell_state, hid_state, m, norm = self.eGRUCell.forward(current_token, cell_state, m, norm)
+            else:
+                cell_state, hid_state, m, norm, z, r = self.eGRUCell.forward(current_token, cell_state, m, norm, diagnostic=True)
+                z = z[0] if z.ndim > 1 else z
+                r = r[0] if r.ndim > 1 else r
+                z_history.append(z.detach().cpu().numpy())
+                r_history.append(r.detach().cpu().numpy())
         
         # The decoding starts here
 
         token = x[:, x.shape[1]-1] #load the <STARTCOPY> entry
-        cell_state, hid_state, m, norm = self.eGRUCell.forward(token, cell_state, m, norm)
+        if not diagnostic:
+            cell_state, hid_state, m, norm = self.eGRUCell.forward(token, cell_state, m, norm)
+        else:
+            cell_state, hid_state, m, norm, z, r = self.eGRUCell.forward(token, cell_state, m, norm, diagnostic=True)
+            z = z[0] if z.ndim > 1 else z
+            r = r[0] if r.ndim > 1 else r
+            z_history.append(z.detach().cpu().numpy())
+            r_history.append(r.detach().cpu().numpy())
         logits = self.eGRUCell.linear_pool(hid_state) #(batch, emb)
         logits_matrix.append(logits)
         token = F.one_hot(torch.argmax(logits, dim=1), num_classes=len(vocab)).float() 
         step=0
 
         while step < max_len:
-            cell_state, hid_state, m, norm = self.eGRUCell.forward(token, cell_state, m, norm)
+            if not diagnostic:
+                cell_state, hid_state, m, norm = self.eGRUCell.forward(token, cell_state, m, norm)
+            else:
+                cell_state, hid_state, m, norm, z, r = self.eGRUCell.forward(token, cell_state, m, norm, diagnostic=True)
+                z = z[0] if z.ndim > 1 else z
+                r = r[0] if r.ndim > 1 else r
+                z_history.append(z.detach().cpu().numpy())
+                r_history.append(r.detach().cpu().numpy())
             logits = self.eGRUCell.linear_pool(hid_state) #(batch, emb)
             logits_matrix.append(logits)
             token = F.one_hot(torch.argmax(logits, dim=1), num_classes=len(vocab)).float()
             step= step +1
 
         final_logits = torch.stack(logits_matrix, dim=1)
+        if not diagnostic:
+            return final_logits
+        else:
+            return final_logits, {
+                "z_gate": z_history,
+                "r_gate": r_history
+            }
 
-        return final_logits
+    
 
 
 class deGRUCell(nn.Module):
@@ -1034,7 +1208,7 @@ class MRRNCell(nn.Module):
 
         self.init_hid = nn.Parameter(torch.randn(hid, device=device) * 0.1)
 
-    def forward(self, x, hid_state):
+    def forward(self, x, hid_state, diagnostic=False):
 
 
         z_tilde = self.W_z(x) + self.U_z(hid_state)
@@ -1046,8 +1220,10 @@ class MRRNCell(nn.Module):
         new_hid_state = z * hid_state + (1-z)*h_tilde
 
     
-
-        return new_hid_state
+        if not diagnostic:
+            return new_hid_state
+        else:
+            return new_hid_state, z
 
 class MRRN(nn.Module):
     def __init__(self, hid, emb, device):
@@ -1087,28 +1263,45 @@ class MRRN(nn.Module):
 
         return final_logits
 
-    def predict_inference(self, x, vocab, max_len=30):
+    def predict_inference(self, x, vocab, max_len=30, diagnostic=False):
 
         batch_size = x.shape[0]
         hid_state = self.MRRNCell.init_hid.unsqueeze(0).expand(batch_size, -1)
 
         logits_matrix = []
+        z_history = []
 
         for i in range(x.shape[1]-1): #last entry is <STARTCOPY>
             current_token = x[:, i] #(batch, dim)
-            hid_state = self.MRRNCell.forward(current_token, hid_state)
+            if not diagnostic:
+                hid_state = self.MRRNCell.forward(current_token, hid_state)
+            else:
+                hid_state, z = self.MRRNCell.forward(current_token, hid_state, diagnostic=True)
+                z = z[0] if z.ndim > 1 else z
+                z_history.append(z.detach().cpu().numpy())
+            
         
         # The decoding starts here
 
         token = x[:, x.shape[1]-1] #load the <STARTCOPY> entry
-        hid_state = self.MRRNCell.forward(token, hid_state)
+        if not diagnostic:
+            hid_state = self.MRRNCell.forward(token, hid_state)
+        else:
+            hid_state, z = self.MRRNCell.forward(token, hid_state, diagnostic=True)
+            z = z[0] if z.ndim > 1 else z
+            z_history.append(z.detach().cpu().numpy())
         logits = self.MRRNCell.linear_pool(hid_state) #(batch, emb)
         logits_matrix.append(logits)
         token = F.one_hot(torch.argmax(logits, dim=1), num_classes=len(vocab)).float() 
         step=0
 
         while step < max_len:
-            hid_state = self.MRRNCell.forward(token, hid_state)
+            if not diagnostic:
+                hid_state = self.MRRNCell.forward(token, hid_state)
+            else:
+                hid_state, z = self.MRRNCell.forward(token, hid_state, diagnostic=True)
+                z = z[0] if z.ndim > 1 else z
+                z_history.append(z.detach().cpu().numpy())
             logits = self.MRRNCell.linear_pool(hid_state) #(batch, emb)
             logits_matrix.append(logits)
             token = F.one_hot(torch.argmax(logits, dim=1), num_classes=len(vocab)).float()
@@ -1116,7 +1309,12 @@ class MRRN(nn.Module):
 
         final_logits = torch.stack(logits_matrix, dim=1)
 
-        return final_logits
+        if not diagnostic:
+            return final_logits
+        else:
+            return final_logits, {
+                "z_gate": z_history
+            }
 
 
 class maGRUCell(nn.Module):
@@ -1137,7 +1335,7 @@ class maGRUCell(nn.Module):
 
         self.init_hid = nn.Parameter(torch.randn(hid, device=device) * 0.1)
 
-    def forward(self, x, hid_state):
+    def forward(self, x, hid_state, diagnostic=False):
 
 
         z_tilde = self.W_z(x) + self.U_z(hid_state)
@@ -1149,8 +1347,10 @@ class maGRUCell(nn.Module):
         new_hid_state = z * hid_state + (1-z)*h_tilde
 
     
-
-        return new_hid_state
+        if not diagnostic:
+            return new_hid_state
+        else:
+            return new_hid_state, z
 
 class maGRU(nn.Module):
     def __init__(self, hid, emb, device):
@@ -1190,28 +1390,45 @@ class maGRU(nn.Module):
 
         return final_logits
 
-    def predict_inference(self, x, vocab, max_len=30):
+    def predict_inference(self, x, vocab, max_len=30, diagnostic=False):
 
         batch_size = x.shape[0]
         hid_state = self.maGRUCell.init_hid.unsqueeze(0).expand(batch_size, -1)
 
         logits_matrix = []
+        z_history = []
 
         for i in range(x.shape[1]-1): #last entry is <STARTCOPY>
             current_token = x[:, i] #(batch, dim)
-            hid_state = self.maGRUCell.forward(current_token, hid_state)
+            if not diagnostic:
+                hid_state = self.maGRUCell.forward(current_token, hid_state)
+            else:
+                hid_state, z = self.maGRUCell.forward(current_token, hid_state, diagnostic=True)
+                z = z[0] if z.ndim > 1 else z
+                z_history.append(z.detach().cpu().numpy())
+            
         
         # The decoding starts here
 
         token = x[:, x.shape[1]-1] #load the <STARTCOPY> entry
-        hid_state = self.maGRUCell.forward(token, hid_state)
+        if not diagnostic:
+            hid_state = self.maGRUCell.forward(token, hid_state)
+        else:
+            hid_state, z = self.maGRUCell.forward(token, hid_state, diagnostic=True)
+            z = z[0] if z.ndim > 1 else z
+            z_history.append(z.detach().cpu().numpy())
         logits = self.maGRUCell.linear_pool(hid_state) #(batch, emb)
         logits_matrix.append(logits)
         token = F.one_hot(torch.argmax(logits, dim=1), num_classes=len(vocab)).float() 
         step=0
 
         while step < max_len:
-            hid_state = self.maGRUCell.forward(token, hid_state)
+            if not diagnostic:
+                hid_state = self.maGRUCell.forward(token, hid_state)
+            else:
+                hid_state, z = self.maGRUCell.forward(token, hid_state, diagnostic=True)
+                z = z[0] if z.ndim > 1 else z
+                z_history.append(z.detach().cpu().numpy())
             logits = self.maGRUCell.linear_pool(hid_state) #(batch, emb)
             logits_matrix.append(logits)
             token = F.one_hot(torch.argmax(logits, dim=1), num_classes=len(vocab)).float()
@@ -1219,4 +1436,9 @@ class maGRU(nn.Module):
 
         final_logits = torch.stack(logits_matrix, dim=1)
 
-        return final_logits
+        if not diagnostic:
+            return final_logits
+        else:
+            return final_logits, {
+                "z_gate": z_history
+            }
