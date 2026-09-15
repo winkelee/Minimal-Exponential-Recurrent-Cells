@@ -137,6 +137,151 @@ class mGRU(nn.Module):
         return final_logits
 
 
+
+
+class CopyLSTM(nn.Module): # To bench mGRU against
+    def __init__(self, hid, emb, device="cuda"):
+        super().__init__()
+
+        self.init_hid = nn.Parameter(torch.randn(hid, device=device) * 0.1)
+        self.LSTMCell = nn.LSTMCell(emb, hid, device=device)
+        self.linear_proj = nn.Linear(hid, emb, device=device)
+
+    def forward(self, x, y):
+
+        batch_size = x.shape[0]
+        hid_state = self.init_hid.unsqueeze(0).expand(batch_size, -1)
+        cell_state = self.init_hid.unsqueeze(0).expand(batch_size, -1)
+        logits_matrix = []
+
+        for i in range(x.shape[1]-1): #last entry is <STARTCOPY>
+            current_token = x[:, i] #(batch, dim)
+            #print(f"{current_token}, {hid_state}, {cell_state}")
+            hid_state, cell_state = self.LSTMCell(current_token, (hid_state, cell_state))
+        
+        # The decoding starts here
+
+        token = x[:, x.shape[1]-1] #load the <STARTCOPY> entry
+        hid_state, cell_state = self.LSTMCell(token, (hid_state, cell_state))
+        logits = self.linear_proj(hid_state) #(batch, emb)
+        logits_matrix.append(logits)
+
+        for i in range(y.shape[1] - 1):
+            token = y[:, i]
+            hid_state, cell_state = self.LSTMCell(token, (hid_state, cell_state))
+            logits = self.linear_proj(hid_state) #(batch, emb)
+            logits_matrix.append(logits)
+
+        final_logits = torch.stack(logits_matrix, dim=1)
+
+        return final_logits
+
+
+    def inspect_step(self, x, h_prev, c_prev):
+        
+        # 1. Unpack weights into 4 chunks: Input, Forget, Cell (candidate), Output
+        W_i, W_f, W_c, W_o = self.LSTMCell.weight_ih.chunk(4, dim=0)
+        U_i, U_f, U_c, U_o = self.LSTMCell.weight_hh.chunk(4, dim=0)
+
+        b_ii, b_if, b_ic, b_io = self.LSTMCell.bias_ih.chunk(4, dim=0)
+        b_hi, b_hf, b_hc, b_ho = self.LSTMCell.bias_hh.chunk(4, dim=0)
+
+        # Combine the biases for cleaner math
+        b_i = b_ii + b_hi
+        b_f = b_if + b_hf
+        b_c = b_ic + b_hc
+        b_o = b_io + b_ho
+
+        # 2. Compute pre-activations
+        i_tilde = F.linear(x, W_i) + F.linear(h_prev, U_i) + b_i
+        f_tilde = F.linear(x, W_f) + F.linear(h_prev, U_f) + b_f
+        c_tilde = F.linear(x, W_c) + F.linear(h_prev, U_c) + b_c
+        o_tilde = F.linear(x, W_o) + F.linear(h_prev, U_o) + b_o
+
+        # 3. Apply standard LSTM non-linearities
+        i = torch.sigmoid(i_tilde)
+        f = torch.sigmoid(f_tilde)
+        g = torch.tanh(c_tilde)      # 'g' is the candidate content (often called z)
+        o = torch.sigmoid(o_tilde)
+
+        # 4. Standard LSTM Cell Update
+        c_next = f * c_prev + i * g
+        h_next = o * torch.tanh(c_next)
+
+        return h_next, c_next, i, f, o
+    
+    def predict_inference(self, x, vocab, max_len=30, diagnostic=False):
+
+        batch_size = x.shape[0]
+        cell_state = self.init_hid.unsqueeze(0).expand(batch_size, -1)
+        hid_state = self.init_hid.unsqueeze(0).expand(batch_size, -1)
+
+        logits_matrix = []
+        i_history = []
+        f_history = []
+        o_history = []
+
+        for j in range(x.shape[1]-1): #last entry is <STARTCOPY>
+            current_token = x[:, j] #(batch, dim)
+            if not diagnostic:
+                hid_state, cell_state = self.LSTMCell(current_token, (hid_state, cell_state))
+            else:
+                hid_state, cell_state, i, f, o = self.inspect_step(current_token, hid_state, cell_state)
+                i = i[0] if i.ndim > 1 else i
+                f = f[0] if f.ndim > 1 else f
+                o = o[0] if o.ndim > 1 else o
+                i_history.append(i.detach().cpu().numpy())
+                f_history.append(f.detach().cpu().numpy())
+                o_history.append(o.detach().cpu().numpy())
+        
+        # The decoding starts here
+
+        token = x[:, x.shape[1]-1] #load the <STARTCOPY> entry
+        if not diagnostic:
+            hid_state, cell_state = self.LSTMCell(token, (hid_state, cell_state))
+        else:
+            hid_state, cell_state, i, f, o = self.inspect_step(token, hid_state, cell_state)
+            i = i[0] if i.ndim > 1 else i
+            f = f[0] if f.ndim > 1 else f
+            o = o[0] if o.ndim > 1 else o
+            i_history.append(i.detach().cpu().numpy())
+            f_history.append(f.detach().cpu().numpy())
+            o_history.append(o.detach().cpu().numpy())
+        logits = self.linear_proj(hid_state) #(batch, emb)
+        logits_matrix.append(logits)
+        token = F.one_hot(torch.argmax(logits, dim=1), num_classes=len(vocab)).float()
+        step=0
+
+        while step < max_len:
+            if not diagnostic:
+                hid_state, cell_state = self.LSTMCell(token, (hid_state, cell_state))
+            else:
+                hid_state, cell_state, i, f, o = self.inspect_step(token, hid_state, cell_state)
+                i = i[0] if i.ndim > 1 else i
+                f = f[0] if f.ndim > 1 else f
+                o = o[0] if o.ndim > 1 else o
+                i_history.append(i.detach().cpu().numpy())
+                f_history.append(f.detach().cpu().numpy())
+                o_history.append(o.detach().cpu().numpy())
+            logits = self.linear_proj(hid_state) #(batch, emb)
+            logits_matrix.append(logits)
+            token = F.one_hot(torch.argmax(logits, dim=1), num_classes=len(vocab)).float()
+            step = step + 1
+
+        final_logits = torch.stack(logits_matrix, dim=1)
+
+        if not diagnostic:
+            return final_logits
+        else:
+            return final_logits, {
+                "i_gate": i_history,
+                "f_gate": f_history,
+                "o_gate": o_history
+            }
+
+
+        
+
 class CopyGRU(nn.Module): # To bench mGRU against
     def __init__(self, hid, emb, device="cuda"):
         super().__init__()
