@@ -76,6 +76,35 @@ class eGRU(nn.Module):
         return logits
 
 
+class LSTM_LM(nn.Module):
+    def __init__(self, vocab_dim=10, hid=256, emb=1, device='cuda'):
+        super().__init__()
+
+        self.hid = hid
+        self.emb = emb
+        self.device = device
+
+        self.LSTMCell = nn.LSTMCell(emb, hid, device=device)
+        self.linear_pool = nn.Linear(hid, vocab_dim, device=device)
+        self.init_hid = nn.Parameter(torch.randn(hid, device=device) * 0.1)
+
+    def forward(self, x):
+        # x is of shape (batch, seq)
+
+        batch_size = x.shape[0]
+
+        hid_state = self.init_hid.unsqueeze(0).expand(batch_size, -1)
+        cell_state = self.init_hid.unsqueeze(0).expand(batch_size, -1)
+
+        for i in range(x.shape[1]):
+            current_token = x[:, i] #(batch, dim)
+            hid_state, cell_state = self.LSTMCell(current_token, (hid_state, cell_state))
+
+        logits = self.linear_pool(hid_state)
+
+
+        return logits
+
 class GRU_LM(nn.Module):
     def __init__(self, vocab_dim=10, hid=256, emb=1, device='cuda'):
         super().__init__()

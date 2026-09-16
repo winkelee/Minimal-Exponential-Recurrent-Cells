@@ -137,14 +137,61 @@ class mGRU(nn.Module):
         return final_logits
 
 
+class ManualLSTMCell(nn.Module):
+    def __init__(self, emb, hid, device="cuda"):
+        super().__init__()
 
+        self.hid = hid
+        self.emb = emb
+
+        # Input Gate
+        self.W_i = nn.Linear(emb, hid, device=device)
+        self.U_i = nn.Linear(hid, hid, bias=False, device=device)
+        
+        # Forget Gate
+        self.W_f = nn.Linear(emb, hid, device=device)
+        self.U_f = nn.Linear(hid, hid, bias=False, device=device)
+        
+        # Candidate Content (g/z)
+        self.W_c = nn.Linear(emb, hid, device=device)
+        self.U_c = nn.Linear(hid, hid, bias=False, device=device)
+        
+        # Output Gate
+        self.W_o = nn.Linear(emb, hid, device=device)
+        self.U_o = nn.Linear(hid, hid, bias=False, device=device)
+
+        # The Jozefowicz Forget Gate Bias Trick!
+        with torch.no_grad():
+            self.W_f.bias.fill_(5.0)
+
+    def forward(self, x, state_tuple, diagnostic=False):
+
+        prev_h = state_tuple[0]
+        prev_c = state_tuple[1]
+        
+        i_tilde = self.W_i(x) + self.U_i(prev_h)
+        f_tilde = self.W_f(x) + self.U_f(prev_h)
+        c_tilde = self.W_c(x) + self.U_c(prev_h)
+        o_tilde = self.W_o(x) + self.U_o(prev_h)
+
+        i = torch.sigmoid(i_tilde)
+        f = torch.sigmoid(f_tilde)
+        g = torch.tanh(c_tilde)
+        o = torch.sigmoid(o_tilde)
+
+        next_c = f * prev_c + i * g
+        next_h = o * torch.tanh(next_c)
+        if not diagnostic:
+            return next_h, next_c
+        else:
+            return next_h, next_c, i, f, o
 
 class CopyLSTM(nn.Module): # To bench mGRU against
     def __init__(self, hid, emb, device="cuda"):
         super().__init__()
 
         self.init_hid = nn.Parameter(torch.randn(hid, device=device) * 0.1)
-        self.LSTMCell = nn.LSTMCell(emb, hid, device=device)
+        self.LSTMCell = ManualLSTMCell(emb, hid, device=device)
         self.linear_proj = nn.Linear(hid, emb, device=device)
 
     def forward(self, x, y):
@@ -177,38 +224,6 @@ class CopyLSTM(nn.Module): # To bench mGRU against
         return final_logits
 
 
-    def inspect_step(self, x, h_prev, c_prev):
-        
-        # 1. Unpack weights into 4 chunks: Input, Forget, Cell (candidate), Output
-        W_i, W_f, W_c, W_o = self.LSTMCell.weight_ih.chunk(4, dim=0)
-        U_i, U_f, U_c, U_o = self.LSTMCell.weight_hh.chunk(4, dim=0)
-
-        b_ii, b_if, b_ic, b_io = self.LSTMCell.bias_ih.chunk(4, dim=0)
-        b_hi, b_hf, b_hc, b_ho = self.LSTMCell.bias_hh.chunk(4, dim=0)
-
-        # Combine the biases for cleaner math
-        b_i = b_ii + b_hi
-        b_f = b_if + b_hf
-        b_c = b_ic + b_hc
-        b_o = b_io + b_ho
-
-        # 2. Compute pre-activations
-        i_tilde = F.linear(x, W_i) + F.linear(h_prev, U_i) + b_i
-        f_tilde = F.linear(x, W_f) + F.linear(h_prev, U_f) + b_f
-        c_tilde = F.linear(x, W_c) + F.linear(h_prev, U_c) + b_c
-        o_tilde = F.linear(x, W_o) + F.linear(h_prev, U_o) + b_o
-
-        # 3. Apply standard LSTM non-linearities
-        i = torch.sigmoid(i_tilde)
-        f = torch.sigmoid(f_tilde)
-        g = torch.tanh(c_tilde)      # 'g' is the candidate content (often called z)
-        o = torch.sigmoid(o_tilde)
-
-        # 4. Standard LSTM Cell Update
-        c_next = f * c_prev + i * g
-        h_next = o * torch.tanh(c_next)
-
-        return h_next, c_next, i, f, o
     
     def predict_inference(self, x, vocab, max_len=30, diagnostic=False):
 
@@ -226,7 +241,7 @@ class CopyLSTM(nn.Module): # To bench mGRU against
             if not diagnostic:
                 hid_state, cell_state = self.LSTMCell(current_token, (hid_state, cell_state))
             else:
-                hid_state, cell_state, i, f, o = self.inspect_step(current_token, hid_state, cell_state)
+                hid_state, cell_state, i, f, o = self.LSTMCell.forward(current_token, (hid_state, cell_state), diagnostic=True)
                 i = i[0] if i.ndim > 1 else i
                 f = f[0] if f.ndim > 1 else f
                 o = o[0] if o.ndim > 1 else o
@@ -240,7 +255,7 @@ class CopyLSTM(nn.Module): # To bench mGRU against
         if not diagnostic:
             hid_state, cell_state = self.LSTMCell(token, (hid_state, cell_state))
         else:
-            hid_state, cell_state, i, f, o = self.inspect_step(token, hid_state, cell_state)
+            hid_state, cell_state, i, f, o = self.LSTMCell.forward(token, (hid_state, cell_state), diagnostic=True)
             i = i[0] if i.ndim > 1 else i
             f = f[0] if f.ndim > 1 else f
             o = o[0] if o.ndim > 1 else o
@@ -256,7 +271,7 @@ class CopyLSTM(nn.Module): # To bench mGRU against
             if not diagnostic:
                 hid_state, cell_state = self.LSTMCell(token, (hid_state, cell_state))
             else:
-                hid_state, cell_state, i, f, o = self.inspect_step(token, hid_state, cell_state)
+                hid_state, cell_state, i, f, o = self.LSTMCell.forward(token, (hid_state, cell_state), diagnostic=True)
                 i = i[0] if i.ndim > 1 else i
                 f = f[0] if f.ndim > 1 else f
                 o = o[0] if o.ndim > 1 else o

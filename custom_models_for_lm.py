@@ -85,6 +85,46 @@ class eGRU(nn.Module):
         return final_logits, cell_state, m, norm
 
 
+class LSTM_LM(nn.Module):
+    def __init__(self, vocab_dim, hid=256, emb=64, device='cuda'):
+        super().__init__()
+
+        self.hid = hid
+        self.emb = emb
+        self.device = device
+
+        self.embedding = nn.Embedding(vocab_dim, emb, device=device)
+        self.LSTMCell = nn.LSTMCell(emb, hid, device=device)
+        self.linear_pool = nn.Linear(hid, vocab_dim, device=device)
+        self.init_hid = nn.Parameter(torch.randn(hid, device=device) * 0.1)
+
+    def forward(self, start_state, x):
+        # x is of shape (batch, seq)
+
+        batch_size = x.shape[0]
+        logits_matrix = []
+
+        #cell_state = self.eGRUCell.init_hid.unsqueeze(0).expand(batch_size, -1)
+        #m = torch.zeros((batch_size, self.hid), device=self.device)
+        #norm = torch.ones((batch_size, self.hid), device=self.device)
+
+        hid_state = start_state
+        cell_state = start_state
+
+        emb_input = self.embedding(x) #(batch, seq, emb)
+
+        for i in range(emb_input.shape[1]): #last entry is <STARTCOPY>
+            current_token = emb_input[:, i] #(batch, dim)
+            hid_state, cell_state = self.LSTMCell(current_token, (hid_state, cell_state))
+            logits = self.linear_pool(hid_state)
+            logits_matrix.append(logits)
+        
+        
+
+        final_logits = torch.stack(logits_matrix, dim=1)
+
+        return final_logits, hid_state
+
 class GRU_LM(nn.Module):
     def __init__(self, vocab_dim, hid=256, emb=64, device='cuda'):
         super().__init__()
