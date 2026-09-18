@@ -76,6 +76,80 @@ class eGRU(nn.Module):
         return logits
 
 
+class ManualLSTMCell(nn.Module):
+    def __init__(self, emb, hid, device="cuda"):
+        super().__init__()
+
+        self.hid = hid
+        self.emb = emb
+
+        # Input Gate
+        self.W_i = nn.Linear(emb, hid, device=device)
+        self.U_i = nn.Linear(hid, hid, bias=False, device=device)
+        
+        # Forget Gate
+        self.W_f = nn.Linear(emb, hid, device=device)
+        self.U_f = nn.Linear(hid, hid, bias=False, device=device)
+        
+        # Candidate Content (g/z)
+        self.W_c = nn.Linear(emb, hid, device=device)
+        self.U_c = nn.Linear(hid, hid, bias=False, device=device)
+        
+        # Output Gate
+        self.W_o = nn.Linear(emb, hid, device=device)
+        self.U_o = nn.Linear(hid, hid, bias=False, device=device)
+
+        # The Jozefowicz Forget Gate Bias Trick!
+        with torch.no_grad():
+            self.W_f.bias.fill_(5.0)
+
+    def forward(self, x, state_tuple, diagnostic=False):
+
+        prev_h = state_tuple[0]
+        prev_c = state_tuple[1]
+        
+        i_tilde = self.W_i(x) + self.U_i(prev_h)
+        f_tilde = self.W_f(x) + self.U_f(prev_h)
+        c_tilde = self.W_c(x) + self.U_c(prev_h)
+        o_tilde = self.W_o(x) + self.U_o(prev_h)
+
+        i = torch.sigmoid(i_tilde)
+        f = torch.sigmoid(f_tilde)
+        g = torch.tanh(c_tilde)
+        o = torch.sigmoid(o_tilde)
+
+        next_c = f * prev_c + i * g
+        next_h = o * torch.tanh(next_c)
+        if not diagnostic:
+            return next_h, next_c
+        else:
+            return next_h, next_c, i, f, o
+
+class LSTM_MNIST_withBiasInit(nn.Module): # To bench mGRU against
+    def __init__(self, vocab_dim=10, hid=256, emb=1, device='cuda'):
+        super().__init__()
+
+        self.LSTMCell = ManualLSTMCell(emb, hid, device=device)
+        self.linear_pool = nn.Linear(hid, vocab_dim, device=device)
+        self.init_hid = nn.Parameter(torch.randn(hid, device=device) * 0.1)
+
+    def forward(self, x):
+        # x is of shape (batch, seq)
+
+        batch_size = x.shape[0]
+
+        hid_state = self.init_hid.unsqueeze(0).expand(batch_size, -1)
+        cell_state = self.init_hid.unsqueeze(0).expand(batch_size, -1)
+
+        for i in range(x.shape[1]):
+            current_token = x[:, i] #(batch, dim)
+            hid_state, cell_state = self.LSTMCell.forward(current_token, (hid_state, cell_state))
+
+        logits = self.linear_pool(hid_state)
+
+
+        return logits
+
 class LSTM_LM(nn.Module):
     def __init__(self, vocab_dim=10, hid=256, emb=1, device='cuda'):
         super().__init__()
