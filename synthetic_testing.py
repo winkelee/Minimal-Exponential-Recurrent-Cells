@@ -294,3 +294,95 @@ def load_model(filename, device, model, optimizer):
     optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
     start_epoch = checkpoint["epoch_saved"] + 1
     return start_epoch
+
+def diagnose(model, copy_size, vocab, batching_function, batching_args, teacher_forcing=False):
+
+    batch_size=1 #Analyzing one random sample
+    batch, targets = batching_function(batching_args)
+    model_targets = F.one_hot(targets, num_classes=len(vocab)).float()
+
+    logits, gates = model.predict_inference(
+        x=batch,
+        vocab=vocab,
+        max_len=copy_size-1,
+        diagnostic=True
+    )
+
+    tokens = torch.argmax(logits, dim=2) # (batch, seq)
+
+    gates = {
+        name: np.array(gate)
+        for name, gate in gates.items()
+    }
+
+    fig, axes = plt.subplots(
+        1,
+        len(gates),
+        figsize=(8 * len(gates), 8)
+    )
+    
+    if len(gates) == 1:
+        axes = [axes]
+    
+    vmin = min(gate.min() for gate in gates.values())
+    vmax = max(gate.max() for gate in gates.values())
+    
+    for ax, (name, gate) in zip(axes, gates.items()):
+        im = ax.imshow(
+            gate.T,
+            cmap="viridis",
+            aspect="auto",
+            vmin=vmin,
+            vmax=vmax
+        )
+    
+        ax.set_title(name)
+        ax.set_xlabel("Step")
+        ax.set_ylabel("Hidden dimension")
+        fig.colorbar(im, ax=ax)
+    
+    plt.tight_layout()
+    plt.show()
+
+    print(gate.min(), gate.max())
+
+
+def diagnose_scalar_graph(model, copy_size, vocab, batching_function, batching_args, teacher_forcing=False):
+
+    batch_size=1 #Analyzing one random sample
+    batch, targets = batching_function(batching_args)
+    model_targets = F.one_hot(targets, num_classes=len(vocab)).float()
+
+    logits, gates = model.predict_inference(
+        x=batch,
+        vocab=vocab,
+        max_len=copy_size-1,
+        diagnostic=True
+    )
+
+    tokens = torch.argmax(logits, dim=2) # (batch, seq)
+
+    gates = {
+        name: np.array(gate)
+        for name, gate in gates.items()
+    }
+
+    fig, axes = plt.subplots(
+        1,
+        len(gates),
+        figsize=(6 * len(gates), 5)
+    )
+    
+    if len(gates) == 1:
+        axes = [axes]
+    
+    for ax, (name, gate) in zip(axes, gates.items()):
+        ax.plot(gate)
+    
+        ax.set_title(name)
+        ax.set_xlabel("Step")
+        ax.set_ylabel("Gate value")
+        ax.grid(alpha=0.3)
+    
+    plt.tight_layout()
+    plt.show()
